@@ -1,0 +1,7 @@
+work
+.env
+.secrets
+artifacts
+cache
+run-act.log
+*.proto
