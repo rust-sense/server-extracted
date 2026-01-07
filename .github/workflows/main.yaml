@@ -1,0 +1,86 @@
+name: Decompile app
+
+on:
+  workflow_dispatch: 
+    inputs:
+      create_release:
+        description: 'Create a release on GitHub'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  download-server:
+    name: Download Rust Dedicated Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install SteamCMD
+        run: |
+          sudo add-apt-repository multiverse
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          echo steam steam/question select "I AGREE" | sudo debconf-set-selections
+          echo steam steam/license note '' | sudo debconf-set-selections
+          sudo apt-get install -y steamcmd
+
+      - name: Cache Rust Dedicated Server
+        id: cache-rust-server
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/rust-server
+          key: rust-server
+          restore-keys: |
+            rust-server
+
+      - name: Download Rust Dedicated Server
+        run: |
+          mkdir -p ${{ github.workspace }}/rust-server
+          steamcmd +force_install_dir ${{ github.workspace }}/rust-server +login anonymous +app_update 258550 validate +quit
+
+      - name: Extract Protobuf Definitions
+        run: |
+          # Install dependencies
+          apt-get update && apt-get install -y python3 python3-pip wget unzip
+          
+          # Download ILSpy command line tool
+          echo "Downloading ILSpy..."
+          wget https://github.com/icsharpcode/ILSpy/releases/download/v9.1/ILSpy_binaries_9.1.0.7988-x64.zip -O ilspy.zip
+          unzip -q ilspy.zip -d ilspy
+          
+          echo "Contents of ILSpy directory:"
+          ls -la ilspy/
+          find ilspy -type f -executable -o -name "*.exe" -o -name "*.dll" | head -20
+          
+          MANAGED_DIR="${{ github.workspace }}/rust-server/RustDedicated_Data/Managed"
+          
+          # Decompile using ILSpy - ILSpy v9.1 uses ilspycmd
+          echo "Decompiling Rust.Data.dll..."
+          
+          # ILSpy v9.1 has ilspycmd in the root
+          if [ -f "ilspy/ilspycmd" ]; then
+            chmod +x ilspy/ilspycmd
+            ilspy/ilspycmd "$MANAGED_DIR/Rust.Data.dll" -p -o decompiled/
+          elif [ -f "ilspy/ILSpy" ]; then
+            chmod +x ilspy/ILSpy
+            ilspy/ILSpy "$MANAGED_DIR/Rust.Data.dll" -p -o decompiled/
+          else
+            echo "ERROR: Could not find ILSpy executable"
+            exit 1
+          fi
+          
+          echo "Decompilation complete. Files created:"
+          ls -la decompiled/
+
+      - name: Upload Generated Proto
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustplus-proto
+          path: ${{ github.workspace }}/rustplus.proto
+          retention-days: 7
+
