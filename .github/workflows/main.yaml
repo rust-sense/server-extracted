@@ -1,0 +1,160 @@
+name: Decompile app
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a release on GitHub"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  download-server:
+    name: Download Rust Dedicated Server
+    runs-on: ubuntu-latest
+    env:
+      RUST_APP_ID: 258550
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Rust Version
+        id: rust-version
+        run: |
+          echo "Fetching current Rust version from Steam API..."
+          RUST_VERSION=$(curl -s https://api.steamcmd.net/v1/info/${{ env.RUST_APP_ID }} | \
+            jq -r '.data["${{ env.RUST_APP_ID }}"].depots.branches["public"].buildid')
+          echo "Current Rust version: $RUST_VERSION"
+          echo "version=$RUST_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Cache Rust Managed Assemblies
+        id: cache-assemblies
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/rust-server-managed-assemblies
+          key: rust-assemblies-${{ steps.rust-version.outputs.version }}
+          restore-keys: |
+            rust-assemblies-
+
+      - name: Install SteamCMD
+        if: steps.cache-assemblies.outputs.cache-hit != 'true'
+        run: |
+          sudo add-apt-repository multiverse
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          echo steam steam/question select "I AGREE" | sudo debconf-set-selections
+          echo steam steam/license note '' | sudo debconf-set-selections
+          sudo apt-get install -y steamcmd
+
+      - name: Download Rust Dedicated Server
+        if: steps.cache-assemblies.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ${{ github.workspace }}/rust-server
+          steamcmd +force_install_dir ${{ github.workspace }}/rust-server +login anonymous +app_update ${{ env.RUST_APP_ID }} validate +quit
+
+          # Copy only the Managed assemblies to cache location
+          echo "Copying Managed assemblies..."
+          mkdir -p ${{ github.workspace }}/rust-server-managed-assemblies
+          cp -r ${{ github.workspace }}/rust-server/RustDedicated_Data/Managed/* ${{ github.workspace }}/rust-server-managed-assemblies/
+
+          echo "Managed assemblies size:"
+          du -sh ${{ github.workspace }}/rust-server-managed-assemblies
+
+      - name: Upload Managed Assemblies
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-managed-assemblies-${{ steps.rust-version.outputs.version }}
+          path: ${{ github.workspace }}/rust-server-managed-assemblies
+          retention-days: 30
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+          dotnet-quality: "preview"
+
+      - name: Build Proto Extractor
+        run: |
+          cd tools/proto-extractor
+          dotnet build -c Release
+
+      - name: Extract Proto Definitions
+        run: |
+          cd tools/proto-extractor
+          dotnet run -c Release -- \
+            "${{ github.workspace }}/rust-server-managed-assemblies/Rust.Data.dll" \
+            "${{ github.workspace }}/rustplus.proto" \
+            rustplus \
+            "--roots=AppRequest,AppResponse,AppMessage,AppBroadcast"
+          echo "Generated proto file:"
+          wc -l "${{ github.workspace }}/rustplus.proto"
+          head -100 "${{ github.workspace }}/rustplus.proto"
+
+      - name: Install Protobuf Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Validate Proto File
+        run: |
+          echo "Validating proto file syntax..."
+          protoc --proto_path=${{ github.workspace }} \
+                 --python_out=/tmp \
+                 ${{ github.workspace }}/rustplus.proto
+          echo "Proto file validation successful!"
+
+      - name: Upload Proto File
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustplus-proto-${{ steps.rust-version.outputs.version }}
+          path: ${{ github.workspace }}/rustplus.proto
+          retention-days: 90
+
+      - name: Create Assemblies Archive
+        run: |
+          cd ${{ github.workspace }}
+          zip -r rust-managed-assemblies.zip rust-server-managed-assemblies/
+
+      - name: Create Release
+        id: create-release
+        if: ${{ inputs.create_release }}
+        run: |
+          RUST_VERSION="${{ steps.rust-version.outputs.version }}"
+          RELEASE_TAG="rust-${RUST_VERSION}"
+          RELEASE_TITLE="Rust+ Build ${RUST_VERSION}"
+          RELEASE_NOTES="## Rust+ Protocol Buffers
+
+          **Rust Build ID:** ${RUST_VERSION}
+          **Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ### Files
+          - \`rustplus.proto\` - Protocol buffer definitions for the Rust+ Companion API
+          - \`rust-managed-assemblies.zip\` - Managed assemblies from Rust Dedicated Server"
+
+          # Check if release already exists
+          if gh release view "$RELEASE_TAG" &>/dev/null; then
+            echo "Release $RELEASE_TAG already exists, updating..."
+            gh release upload "$RELEASE_TAG" \
+              "${{ github.workspace }}/rustplus.proto" \
+              "${{ github.workspace }}/rust-managed-assemblies.zip" \
+              --clobber
+          else
+            echo "Creating new release $RELEASE_TAG..."
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              "${{ github.workspace }}/rustplus.proto" \
+              "${{ github.workspace }}/rust-managed-assemblies.zip"
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Print Release URL
+        if: ${{ inputs.create_release }}
+        run: |
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.create-release.outputs.release_tag }}"
