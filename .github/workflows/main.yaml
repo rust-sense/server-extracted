@@ -3,6 +3,10 @@ name: Decompile app
 on:
   workflow_dispatch:
     inputs:
+      steam_branch:
+        description: "Steam branch to download (e.g. public, staging, aux01)"
+        type: string
+        default: "public"
       create_release:
         description: "Create a release on GitHub"
         type: boolean
@@ -18,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUST_APP_ID: 258550
+      STEAM_BRANCH: ${{ inputs.steam_branch || 'public' }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout repository
@@ -26,9 +31,14 @@ jobs:
       - name: Get Rust Version
         id: rust-version
         run: |
-          echo "Fetching current Rust version from Steam API..."
-          RUST_VERSION=$(curl -s https://api.steamcmd.net/v1/info/${{ env.RUST_APP_ID }} | \
-            jq -r '.data["${{ env.RUST_APP_ID }}"].depots.branches["public"].buildid')
+          echo "Fetching current Rust version for branch '$STEAM_BRANCH' from Steam API..."
+          RUST_VERSION=$(curl -s "https://api.steamcmd.net/v1/info/${RUST_APP_ID}" | \
+            jq -r --arg appid "$RUST_APP_ID" --arg branch "$STEAM_BRANCH" \
+              '.data[$appid].depots.branches[$branch].buildid')
+          if [ -z "$RUST_VERSION" ] || [ "$RUST_VERSION" = "null" ]; then
+            echo "::error::No buildid found for branch '$STEAM_BRANCH'"
+            exit 1
+          fi
           echo "Current Rust version: $RUST_VERSION"
           echo "version=$RUST_VERSION" >> $GITHUB_OUTPUT
 
@@ -37,9 +47,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/rust-server-managed-assemblies
-          key: rust-assemblies-${{ steps.rust-version.outputs.version }}
+          key: rust-assemblies-${{ env.STEAM_BRANCH }}-${{ steps.rust-version.outputs.version }}
           restore-keys: |
-            rust-assemblies-
+            rust-assemblies-${{ env.STEAM_BRANCH }}-
 
       - name: Install SteamCMD
         if: steps.cache-assemblies.outputs.cache-hit != 'true'
@@ -55,10 +65,17 @@ jobs:
         if: steps.cache-assemblies.outputs.cache-hit != 'true'
         run: |
           mkdir -p ${{ github.workspace }}/rust-server
-          steamcmd +force_install_dir ${{ github.workspace }}/rust-server +login anonymous +app_update ${{ env.RUST_APP_ID }} validate +quit
+
+          BETA_ARGS=""
+          if [ -n "$STEAM_BRANCH" ] && [ "$STEAM_BRANCH" != "public" ]; then
+            BETA_ARGS="-beta $STEAM_BRANCH"
+          fi
+
+          steamcmd +force_install_dir ${{ github.workspace }}/rust-server +login anonymous +app_update ${{ env.RUST_APP_ID }} $BETA_ARGS validate +quit
 
           # Copy only the Managed assemblies to cache location
           echo "Copying Managed assemblies..."
+          rm -rf ${{ github.workspace }}/rust-server-managed-assemblies
           mkdir -p ${{ github.workspace }}/rust-server-managed-assemblies
           cp -r ${{ github.workspace }}/rust-server/RustDedicated_Data/Managed/* ${{ github.workspace }}/rust-server-managed-assemblies/
 
@@ -68,7 +85,7 @@ jobs:
       - name: Upload Managed Assemblies
         uses: actions/upload-artifact@v4
         with:
-          name: rust-managed-assemblies-${{ steps.rust-version.outputs.version }}
+          name: rust-managed-assemblies-${{ env.STEAM_BRANCH }}-${{ steps.rust-version.outputs.version }}
           path: ${{ github.workspace }}/rust-server-managed-assemblies
           retention-days: 30
 
@@ -111,7 +128,7 @@ jobs:
       - name: Upload Proto File
         uses: actions/upload-artifact@v4
         with:
-          name: rustplus-proto-${{ steps.rust-version.outputs.version }}
+          name: rustplus-proto-${{ env.STEAM_BRANCH }}-${{ steps.rust-version.outputs.version }}
           path: ${{ github.workspace }}/rustplus.proto
           retention-days: 90
 
@@ -125,11 +142,21 @@ jobs:
         if: ${{ inputs.create_release }}
         run: |
           RUST_VERSION="${{ steps.rust-version.outputs.version }}"
-          RELEASE_TAG="rust-${RUST_VERSION}"
-          RELEASE_TITLE="Rust+ Build ${RUST_VERSION}"
+
+          if [ "$STEAM_BRANCH" = "public" ]; then
+            RELEASE_TAG="rust-${RUST_VERSION}"
+            RELEASE_TITLE="Rust+ Build ${RUST_VERSION}"
+            PRERELEASE=""
+          else
+            RELEASE_TAG="rust-${STEAM_BRANCH}-${RUST_VERSION}"
+            RELEASE_TITLE="Rust+ Build ${RUST_VERSION} (${STEAM_BRANCH})"
+            PRERELEASE="--prerelease"
+          fi
+
           RELEASE_NOTES="## Rust+ Protocol Buffers
 
           **Rust Build ID:** ${RUST_VERSION}
+          **Steam Branch:** ${STEAM_BRANCH}
           **Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
           ### Files
@@ -143,11 +170,15 @@ jobs:
               "${{ github.workspace }}/rustplus.proto" \
               "${{ github.workspace }}/rust-managed-assemblies.zip" \
               --clobber
+            if [ -n "$PRERELEASE" ]; then
+              gh release edit "$RELEASE_TAG" --prerelease
+            fi
           else
             echo "Creating new release $RELEASE_TAG..."
             gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TITLE" \
               --notes "$RELEASE_NOTES" \
+              $PRERELEASE \
               "${{ github.workspace }}/rustplus.proto" \
               "${{ github.workspace }}/rust-managed-assemblies.zip"
           fi
