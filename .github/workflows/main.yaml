@@ -20,6 +20,7 @@ jobs:
   download-server:
     name: Download Rust Dedicated Server
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       RUST_APP_ID: 258550
       STEAM_BRANCH: ${{ inputs.steam_branch || 'public' }}
@@ -51,10 +52,29 @@ jobs:
           restore-keys: |
             rust-assemblies-${{ env.STEAM_BRANCH }}-
 
+      - name: Prefer a responsive apt mirror
+        run: |
+          # azure.archive.ubuntu.com intermittently accepts connections and then
+          # never answers. apt retries that mirror for every index before failing
+          # over, so `apt-get update` can sit here for the better part of an hour.
+          # https://github.com/actions/runner-images/issues/14594
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            {
+              printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\n'
+              printf 'https://security.ubuntu.com/ubuntu/\tpriority:2\n'
+              printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:3\n'
+            } | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          printf 'Acquire::Retries "1";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+
       - name: Install SteamCMD
         if: steps.cache-assemblies.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo add-apt-repository multiverse
+          sudo add-apt-repository -y --no-update multiverse
           sudo dpkg --add-architecture i386
           sudo apt-get update
           echo steam steam/question select "I AGREE" | sudo debconf-set-selections
@@ -113,6 +133,9 @@ jobs:
           head -100 "${{ github.workspace }}/rustplus.proto"
 
       - name: Install Protobuf Compiler
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
